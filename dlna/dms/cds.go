@@ -100,12 +100,12 @@ func (me *contentDirectoryService) cdsObjectDynamicStreamToUpnpavObject(cdsObjec
 	obj.AlbumArtURI = iconURI
 
 	switch dmsMediaItem.Type {
-		case "video":
-			obj.Class = "object.item.videoItem"
-		case "audio":
-			obj.Class = "object.item.audioItem"
-		default:
-			obj.Class = "object.item.videoItem"
+	case "video":
+		obj.Class = "object.item.videoItem"
+	case "audio":
+		obj.Class = "object.item.audioItem"
+	default:
+		obj.Class = "object.item.videoItem"
 	}
 
 	obj.Title = dmsMediaItem.Title
@@ -126,13 +126,10 @@ func (me *contentDirectoryService) cdsObjectDynamicStreamToUpnpavObject(cdsObjec
 		}
 		item.Res = append(item.Res, upnpav.Resource{
 			URL: (&url.URL{
-				Scheme: "http",
-				Host:   host,
-				Path:   resPath,
-				RawQuery: url.Values{
-					"path":  {cdsObject.Path},
-					"index": {strconv.Itoa(i)},
-				}.Encode(),
+				Scheme:   "http",
+				Host:     host,
+				Path:     resPath + cdsObject.Path,
+				RawQuery: url.Values{"index": {strconv.Itoa(i)}}.Encode(),
 			}).String(),
 			ProtocolInfo: fmt.Sprintf("http-get:*:%s:%s", dmsStream.MimeType, dlna.ContentFeatures{
 				ProfileName:     dmsStream.DlnaProfileName,
@@ -275,10 +272,7 @@ func (me *contentDirectoryService) cdsObjectToUpnpavObject(
 		URL: (&url.URL{
 			Scheme: "http",
 			Host:   host,
-			Path:   resPath,
-			RawQuery: url.Values{
-				"path": {cdsObject.Path},
-			}.Encode(),
+			Path:   resPath + cdsObject.Path,
 		}).String(),
 		ProtocolInfo: fmt.Sprintf("http-get:*:%s:%s", mimeType, dlna.ContentFeatures{
 			SupportRange: true,

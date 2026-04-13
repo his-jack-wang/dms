@@ -349,13 +349,10 @@ func transcodeResources(host, path, resolution, duration string) (ret []upnpav.R
 				ProfileName:     v.DLNAProfileName,
 			}.String()),
 			URL: (&url.URL{
-				Scheme: "http",
-				Host:   host,
-				Path:   resPath,
-				RawQuery: url.Values{
-					"path":      {path},
-					"transcode": {k},
-				}.Encode(),
+				Scheme:   "http",
+				Host:     host,
+				Path:     resPath + path,
+				RawQuery: url.Values{"transcode": {k}}.Encode(),
 			}).String(),
 			Resolution: resolution,
 			Duration:   duration,
@@ -837,8 +834,13 @@ func (server *Server) initMux(mux *http.ServeMux) {
 	mux.HandleFunc(contentDirectoryEventSubURL, server.contentDirectoryEventSubHandler)
 	mux.HandleFunc(iconPath, server.serveIcon)
 	mux.HandleFunc(subtitlePath, server.serveSubtitle)
-	mux.HandleFunc(resPath, func(w http.ResponseWriter, r *http.Request) {
-		filePath := server.filePath(r.URL.Query().Get("path"))
+	mux.HandleFunc(resPath+"/", func(w http.ResponseWriter, r *http.Request) {
+		reqPath, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, resPath))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		filePath := server.filePath(reqPath)
 		if ignored, err := server.IgnorePath(filePath); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
