@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -13,26 +14,42 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anacrolix/log"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
-	AddrString = "239.255.255.250:1900"
-	rootDevice = "upnp:rootdevice"
-	aliveNTS   = "ssdp:alive"
-	byebyeNTS  = "ssdp:byebye"
-	mxMax      = 10
+	AddrString    = "239.255.255.250:1900"
+	AddrString6LL = "[ff02::c]:1900"
+	AddrString6SL = "[ff05::c]:1900"
+	rootDevice    = "upnp:rootdevice"
+	aliveNTS      = "ssdp:alive"
+	byebyeNTS     = "ssdp:byebye"
+	mxMax         = 10
 )
 
 var NetAddr *net.UDPAddr
+var NetAddr6LL *net.UDPAddr
+var NetAddr6SL *net.UDPAddr
+var AddrString2NetAdd map[string]*net.UDPAddr = make(map[string]*net.UDPAddr, 3)
 
 func init() {
 	var err error
 	NetAddr, err = net.ResolveUDPAddr("udp4", AddrString)
 	if err != nil {
-		log.Printf("Could not resolve %s: %s", AddrString, err)
+		slog.Info("could not resolve address", "address", AddrString, "error", err)
 	}
+	NetAddr6LL, err = net.ResolveUDPAddr("udp6", AddrString6LL)
+	if err != nil {
+		slog.Info("could not resolve address", "address", AddrString6LL, "error", err)
+	}
+	NetAddr6SL, err = net.ResolveUDPAddr("udp6", AddrString6SL)
+	if err != nil {
+		slog.Info("could not resolve address", "address", AddrString6SL, "error", err)
+	}
+	AddrString2NetAdd[AddrString] = NetAddr
+	AddrString2NetAdd[AddrString6LL] = NetAddr6LL
+	AddrString2NetAdd[AddrString6SL] = NetAddr6SL
 }
 
 type badStringError struct {
@@ -81,6 +98,8 @@ func ReadRequest(b *bufio.Reader) (req *http.Request, err error) {
 type Server struct {
 	conn           *net.UDPConn
 	Interface      net.Interface
+	AddrString     string
+	NetAddr        *net.UDPAddr
 	Server         string
 	Services       []string
 	Devices        []string
@@ -89,17 +108,24 @@ type Server struct {
 	UUID           string
 	NotifyInterval time.Duration
 	closed         chan struct{}
-	Logger         log.Logger
+	Logger         *slog.Logger
 }
 
-func makeConn(ifi net.Interface) (ret *net.UDPConn, err error) {
-	ret, err = net.ListenMulticastUDP("udp", &ifi, NetAddr)
+func makeConn(ifi net.Interface, netAddr *net.UDPAddr) (ret *net.UDPConn, err error) {
+	ret, err = net.ListenMulticastUDP("udp", &ifi, netAddr)
 	if err != nil {
 		return
 	}
-	p := ipv4.NewPacketConn(ret)
-	if err := p.SetMulticastTTL(2); err != nil {
-		log.Print(err)
+	if netAddr.IP.String() == AddrString {
+		p := ipv4.NewPacketConn(ret)
+		if err := p.SetMulticastTTL(2); err != nil {
+			slog.Info("error setting multicast TTL", "error", err)
+		}
+	} else {
+		p := ipv6.NewPacketConn(ret)
+		if err := p.SetMulticastHopLimit(2); err != nil {
+			slog.Info("error setting multicast hop limit", "error", err, "interface", ifi.Name)
+		}
 	}
 	// if err := p.SetMulticastLoopback(true); err != nil {
 	// 	log.Println(err)
@@ -123,7 +149,7 @@ func (me *Server) serve() {
 		default:
 		}
 		if err != nil {
-			me.Logger.Printf("error reading from UDP socket: %s", err)
+			me.Logger.Info("error reading from UDP socket", "error", err)
 			break
 		}
 		go me.handle(b[:n], addr)
@@ -132,7 +158,7 @@ func (me *Server) serve() {
 
 func (me *Server) Init() (err error) {
 	me.closed = make(chan struct{})
-	me.conn, err = makeConn(me.Interface)
+	me.conn, err = makeConn(me.Interface, me.NetAddr)
 	if me.IPFilter == nil {
 		me.IPFilter = func(net.IP) bool { return true }
 	}
@@ -195,7 +221,7 @@ func (me *Server) usnFromTarget(target string) string {
 
 func (me *Server) makeNotifyMessage(target, nts string, extraHdrs [][2]string) []byte {
 	lines := [...][2]string{
-		{"HOST", AddrString},
+		{"HOST", me.AddrString},
 		{"NT", target},
 		{"NTS", nts},
 		{"SERVER", me.Server},
@@ -218,31 +244,38 @@ func (me *Server) makeNotifyMessage(target, nts string, extraHdrs [][2]string) [
 
 func (me *Server) send(buf []byte, addr *net.UDPAddr) {
 	if n, err := me.conn.WriteToUDP(buf, addr); err != nil {
-		me.Logger.Printf("error writing to UDP socket: %s", err)
+		// TODO: Find a better way to do this.
+		me.Logger.Debug("error writing to UDP socket", "error", err)
 	} else if n != len(buf) {
-		me.Logger.Printf("short write: %d/%d bytes", n, len(buf))
+		me.Logger.Info("short write", "written", n, "total", len(buf))
 	}
 }
 
 func (me *Server) delayedSend(delay time.Duration, buf []byte, addr *net.UDPAddr) {
 	go func() {
+		timer := time.NewTimer(delay)
 		select {
-		case <-time.After(delay):
+		case <-timer.C:
 			me.send(buf, addr)
 		case <-me.closed:
+			if !timer.Stop() {
+				<-timer.C
+			}
 		}
 	}()
 }
 
 func (me *Server) log(args ...interface{}) {
+	// Convert args to a message for slog
 	args = append([]interface{}{me.Interface.Name + ":"}, args...)
-	me.Logger.Print(args...)
+	msg := fmt.Sprint(args...)
+	me.Logger.Info(msg)
 }
 
 func (me *Server) sendByeBye() {
 	for _, type_ := range me.allTypes() {
 		buf := me.makeNotifyMessage(type_, byebyeNTS, nil)
-		me.send(buf, NetAddr)
+		me.send(buf, me.NetAddr)
 	}
 }
 
@@ -250,7 +283,7 @@ func (me *Server) notifyAll(nts string, extraHdrs [][2]string) {
 	for _, type_ := range me.allTypes() {
 		buf := me.makeNotifyMessage(type_, nts, extraHdrs)
 		delay := time.Duration(rand.Int63n(int64(100 * time.Millisecond)))
-		me.delayedSend(delay, buf, NetAddr)
+		me.delayedSend(delay, buf, me.NetAddr)
 	}
 }
 
@@ -268,18 +301,18 @@ func (me *Server) allTypes() (ret []string) {
 func (me *Server) handle(buf []byte, sender *net.UDPAddr) {
 	req, err := ReadRequest(bufio.NewReader(bytes.NewReader(buf)))
 	if err != nil {
-		me.Logger.Println(err)
+		me.Logger.Info("error reading request", "error", err)
 		return
 	}
 	if req.Method != "M-SEARCH" || req.Header.Get("man") != `"ssdp:discover"` {
 		return
 	}
 	var mx int64
-	if req.Header.Get("Host") == AddrString {
+	if req.Header.Get("Host") == me.AddrString {
 		mxHeader := req.Header.Get("mx")
 		i, err := strconv.ParseUint(mxHeader, 0, 0)
 		if err != nil {
-			me.Logger.Printf("Invalid mx header %q: %s", mxHeader, err)
+			me.Logger.Info("invalid mx header", "header", mxHeader, "error", err)
 			return
 		}
 		mx = int64(i)

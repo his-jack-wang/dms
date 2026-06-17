@@ -4,18 +4,17 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/anacrolix/ffprobe"
-	"github.com/anacrolix/log"
 
 	"github.com/anacrolix/dms/dlna"
 	"github.com/anacrolix/dms/misc"
@@ -73,11 +72,11 @@ func readDynamicStream(metadataPath string) (*dmsDynamicMediaItem, error) {
 	return &re, nil
 }
 
-func (me *contentDirectoryService) cdsObjectDynamicStreamToUpnpavObject(cdsObject object, fileInfo os.FileInfo, host, userAgent string) (ret interface{}, err error) {
+func (me *contentDirectoryService) cdsObjectDynamicStreamToUpnpavObject(cdsObject object, fileInfo fs.FileInfo, host, userAgent string) (ret interface{}, err error) {
 	// at this point we know that entryFilePath points to a .dms.json file; slurp and parse
 	dmsMediaItem, err := readDynamicStream(cdsObject.FilePath())
 	if err != nil {
-		me.Logger.Printf("%s ignored: %v", cdsObject.FilePath(), err)
+		me.Logger.Info("file ignored", "path", cdsObject.FilePath(), "error", err)
 		return
 	}
 
@@ -112,6 +111,7 @@ func (me *contentDirectoryService) cdsObjectDynamicStreamToUpnpavObject(cdsObjec
 	if obj.Title == "" {
 		obj.Title = strings.TrimSuffix(fileInfo.Name(), dmsMetadataSuffix)
 	}
+	obj.Date = upnpav.Timestamp{Time: fileInfo.ModTime()}
 
 	item := upnpav.Item{
 		Object: obj,
@@ -166,7 +166,7 @@ func (me *contentDirectoryService) cdsObjectDynamicStreamToUpnpavObject(cdsObjec
 // returned if the entry is not of interest.
 func (me *contentDirectoryService) cdsObjectToUpnpavObject(
 	cdsObject object,
-	fileInfo os.FileInfo,
+	fileInfo fs.FileInfo,
 	host, userAgent string,
 ) (ret interface{}, err error) {
 	entryFilePath := cdsObject.FilePath()
@@ -197,20 +197,20 @@ func (me *contentDirectoryService) cdsObjectToUpnpavObject(
 		return
 	}
 	if !fileInfo.Mode().IsRegular() {
-		me.Logger.Printf("%s ignored: non-regular file", cdsObject.FilePath())
+		me.Logger.Info("ignored: non-regular file", "path", cdsObject.FilePath())
 		return
 	}
-	mimeType, err := MimeTypeByPath(entryFilePath)
+	mimeType, err := MimeTypeByPath(me.FS, entryFilePath)
 	if err != nil {
 		return
 	}
 	if !mimeType.IsMedia() {
 		if isDmsMetadata {
-			me.Logger.Levelf(
-				log.Debug,
-				"ignored %q: enable support for dynamic streams via the -allowDynamicStreams command line flag", cdsObject.FilePath())
+			me.Logger.Debug(
+				"ignored: enable support for dynamic streams via the -allowDynamicStreams command line flag",
+				"path", cdsObject.FilePath())
 		} else {
-			me.Logger.Levelf(log.Debug, "ignored %q: non-media file (%s)", cdsObject.FilePath(), mimeType)
+			me.Logger.Debug("ignored: non-media file", "path", cdsObject.FilePath(), "mime_type", mimeType)
 		}
 		return
 	}
@@ -244,7 +244,7 @@ func (me *contentDirectoryService) cdsObjectToUpnpavObject(
 			}
 		case ffprobe.ExeNotFound:
 		default:
-			me.Logger.Printf("error probing %s: %s", entryFilePath, probeErr)
+			me.Logger.Info("error probing", "path", entryFilePath, "error", probeErr)
 		}
 	}
 	if obj.Title == "" {
@@ -325,7 +325,7 @@ func (me *contentDirectoryService) readContainer(
 		// TODO(anacrolix): Dig up why this special cast was added.
 		FoldersLast: strings.Contains(userAgent, `AwoX/1.1`),
 	}
-	sfis.fileInfoSlice, err = o.readDir()
+	sfis.fileInfoSlice, err = o.readDir(me.FS)
 	if err != nil {
 		return
 	}
@@ -334,7 +334,7 @@ func (me *contentDirectoryService) readContainer(
 		child := object{path.Join(o.Path, fi.Name()), me.RootObjectPath}
 		obj, err := me.cdsObjectToUpnpavObject(child, fi, host, userAgent)
 		if err != nil {
-			me.Logger.Printf("error with %s: %s", child.FilePath(), err)
+			me.Logger.Info("error with object", "path", child.FilePath(), "error", err)
 			continue
 		}
 		if obj != nil {
@@ -359,13 +359,9 @@ func (me *contentDirectoryService) objectFromID(id string) (o object, err error)
 		return
 	}
 	if o.Path == "0" {
-		o.Path = "/"
+		o.Path = "./"
 	}
 	o.Path = path.Clean(o.Path)
-	if !path.IsAbs(o.Path) {
-		err = fmt.Errorf("bad ObjectID %v", o.Path)
-		return
-	}
 	o.RootObjectPath = me.RootObjectPath
 	return
 }
@@ -389,7 +385,7 @@ func (me *contentDirectoryService) Handle(action string, argsXML []byte, r *http
 		}
 		obj, err := me.objectFromID(browse.ObjectID)
 		if err != nil {
-			return nil, upnp.Errorf(upnpav.NoSuchObjectErrorCode, err.Error())
+			return nil, upnp.Errorf(upnpav.NoSuchObjectErrorCode, "%s", err.Error())
 		}
 		switch browse.BrowseFlag {
 		case "BrowseDirectChildren":
@@ -400,7 +396,7 @@ func (me *contentDirectoryService) Handle(action string, argsXML []byte, r *http
 				objs, err = me.OnBrowseDirectChildren(obj.Path, obj.RootObjectPath, host, userAgent)
 			}
 			if err != nil {
-				return nil, upnp.Errorf(upnpav.NoSuchObjectErrorCode, err.Error())
+				return nil, upnp.Errorf(upnpav.NoSuchObjectErrorCode, "%s", err.Error())
 			}
 			totalMatches := len(objs)
 			objs = objs[func() (low int) {
@@ -427,8 +423,8 @@ func (me *contentDirectoryService) Handle(action string, argsXML []byte, r *http
 			var ret interface{}
 			var err error
 			if me.OnBrowseMetadata == nil {
-				var fileInfo os.FileInfo
-				fileInfo, err = os.Stat(obj.FilePath())
+				var fileInfo fs.FileInfo
+				fileInfo, err = fs.Stat(me.FS, obj.FilePath())
 				if err != nil {
 					if os.IsNotExist(err) {
 						return nil, &upnp.Error{
@@ -493,29 +489,99 @@ type object struct {
 	RootObjectPath string
 }
 
-// Returns the number of children this object has, such as for a container.
-func (cds *contentDirectoryService) objectChildCount(me object) int {
-	objs, err := cds.readContainer(me, "", "")
+func (me *contentDirectoryService) isOfInterest(
+	cdsObject object,
+	fileInfo fs.FileInfo,
+) (ret bool, err error) {
+	entryFilePath := cdsObject.FilePath()
+	ignored, err := me.IgnorePath(entryFilePath)
 	if err != nil {
-		cds.Logger.Printf("error reading container: %s", err)
+		return
 	}
-	return len(objs)
+	if ignored {
+		return
+	}
+	isDmsMetadata := strings.HasSuffix(entryFilePath, dmsMetadataSuffix)
+	if !fileInfo.IsDir() && me.AllowDynamicStreams && isDmsMetadata {
+		return true, nil
+	}
+
+	if fileInfo.IsDir() {
+		hasChildren, err := me.objectHasChildren(cdsObject, fileInfo)
+		return hasChildren, err
+	}
+	if !fileInfo.Mode().IsRegular() {
+		me.Logger.Info("ignored: non-regular file", "path", cdsObject.FilePath())
+		return
+	}
+
+	mimeType, err := MimeTypeByPath(me.FS, entryFilePath)
+	if err != nil {
+		return
+	}
+
+	if !mimeType.IsMedia() {
+		return
+	}
+	return true, nil
 }
 
-func (cds *contentDirectoryService) objectHasChildren(obj object) bool {
-	return cds.objectChildCount(obj) != 0
+// Returns the number of children this object has, such as for a container.
+func (cds *contentDirectoryService) objectChildCount(me object) (count int) {
+	fileInfoSlice, err := me.readDir(cds.FS)
+	if err != nil {
+		return
+	}
+	for _, fi := range fileInfoSlice {
+		child := object{path.Join(me.Path, fi.Name()), cds.RootObjectPath}
+		isChild, err := cds.isOfInterest(child, fi)
+		if err != nil {
+			cds.Logger.Info("error with object", "path", child.FilePath(), "error", err)
+			continue
+		}
+
+		if isChild {
+			count++
+		}
+	}
+	return
+}
+
+// Returns true if a recursive search for playable items in the provided
+// directory succeeds. Returns true on first hit.
+func (me *contentDirectoryService) objectHasChildren(
+	cdsObject object,
+	fileInfo fs.FileInfo,
+) (ret bool, err error) {
+	if !fileInfo.IsDir() {
+		panic("Expected directory")
+	}
+
+	files, err := cdsObject.readDir(me.FS)
+	if err != nil {
+		return
+	}
+	for _, fi := range files {
+		child := object{path.Join(cdsObject.Path, fi.Name()), me.RootObjectPath}
+		isCdsObj, err := me.isOfInterest(child, fi)
+		if err != nil {
+			return false, err
+		}
+		if isCdsObj {
+			// Return on first hit. We don't want a full library scan.
+			return true, nil
+		}
+	}
+	return
 }
 
 // Returns the actual local filesystem path for the object.
 func (o *object) FilePath() string {
-	return filepath.Join(o.RootObjectPath, filepath.FromSlash(o.Path))
+	return path.Join(o.RootObjectPath, path.Clean(o.Path))
 }
 
 // Returns the ObjectID for the object. This is used in various ContentDirectory actions.
 func (o object) ID() string {
-	if !path.IsAbs(o.Path) {
-		log.Panicf("Relative object path: %s", o.Path)
-	}
 	if len(o.Path) == 1 {
 		return "0"
 	}
@@ -523,7 +589,7 @@ func (o object) ID() string {
 }
 
 func (o *object) IsRoot() bool {
-	return o.Path == "/"
+	return o.Path == "./"
 }
 
 // Returns the object's parent ObjectID. Fortunately it can be deduced from the
@@ -538,31 +604,21 @@ func (o object) ParentID() string {
 
 // This function exists rather than just calling os.(*File).Readdir because I
 // want to stat(), not lstat() each entry.
-func (o *object) readDir() (fis []os.FileInfo, err error) {
-	dirPath := o.FilePath()
-	dirFile, err := os.Open(dirPath)
+func (o *object) readDir(fsys fs.FS) (fis []fs.FileInfo, err error) {
+	dirFile, err := fs.ReadDir(fsys, o.Path)
 	if err != nil {
 		return
 	}
-	defer dirFile.Close()
-	var dirContent []string
-	dirContent, err = dirFile.Readdirnames(-1)
-	if err != nil {
-		return
-	}
-	fis = make([]os.FileInfo, 0, len(dirContent))
-	for _, file := range dirContent {
-		fi, err := os.Stat(filepath.Join(dirPath, file))
-		if err != nil {
-			continue
-		}
+	fis = make([]fs.FileInfo, 0, len(dirFile))
+	for _, file := range dirFile {
+		fi, _ := file.Info()
 		fis = append(fis, fi)
 	}
 	return
 }
 
 type sortableFileInfoSlice struct {
-	fileInfoSlice []os.FileInfo
+	fileInfoSlice []fs.FileInfo
 	FoldersLast   bool
 }
 

@@ -1,24 +1,23 @@
 package dms
 
 import (
+	"io/fs"
+	"log/slog"
 	"mime"
 	"net/http"
-	"os"
 	"path"
 	"strings"
-
-	"github.com/anacrolix/log"
 )
 
 func init() {
 	if err := mime.AddExtensionType(".rmvb", "application/vnd.rn-realmedia-vbr"); err != nil {
-		log.Printf("Could not register application/vnd.rn-realmedia-vbr MIME type: %s", err)
+		slog.Info("could not register MIME type", "mime_type", "application/vnd.rn-realmedia-vbr", "error", err)
 	}
 	if err := mime.AddExtensionType(".ogv", "video/ogg"); err != nil {
-		log.Printf("Could not register video/ogg MIME type: %s", err)
+		slog.Info("could not register MIME type", "mime_type", "video/ogg", "error", err)
 	}
 	if err := mime.AddExtensionType(".ogg", "audio/ogg"); err != nil {
-		log.Printf("Could not register audio/ogg MIME type: %s", err)
+		slog.Info("could not register MIME type", "mime_type", "audio/ogg", "error", err)
 	}
 }
 
@@ -56,10 +55,10 @@ func (mt mimeType) String() string {
 }
 
 // MimeTypeByPath determines the MIME-type of file at the given path
-func MimeTypeByPath(filePath string) (ret mimeType, err error) {
+func MimeTypeByPath(fsys fs.FS, filePath string) (ret mimeType, err error) {
 	ret = mimeTypeByBaseName(path.Base(filePath))
 	if ret == "" {
-		ret, err = mimeTypeByContent(filePath)
+		ret, err = mimeTypeByContent(fsys, filePath)
 	}
 	if ret == "video/x-msvideo" {
 		ret = "video/avi"
@@ -80,8 +79,8 @@ func mimeTypeByBaseName(name string) mimeType {
 }
 
 // Guess the MIME-type by analysing the first 512 bytes of the file.
-func mimeTypeByContent(path string) (ret mimeType, err error) {
-	file, err := os.Open(path)
+func mimeTypeByContent(fsys fs.FS, path string) (ret mimeType, err error) {
+	file, err := fsys.Open(path)
 	if err != nil {
 		return
 	}
