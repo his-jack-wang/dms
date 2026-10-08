@@ -1,12 +1,10 @@
-//go:build !linux && !darwin && !windows
-// +build !linux,!darwin,!windows
+//go:build !linux && !darwin && !windows && !openbsd
+// +build !linux,!darwin,!windows,!openbsd
 
 package dms
 
-func isHiddenPath(path string) (bool, error) {
-	return false, nil
-}
+import "io/fs"
 
-func isReadablePath(path string) (bool, error) {
-	return tryToOpenPath(path)
+func isHiddenPath(fsys fs.FS, path string) (bool, error) {
+	return false, nil
 }

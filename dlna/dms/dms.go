@@ -248,6 +248,11 @@ type Server struct {
 	Interfaces             []net.Interface
 	httpServeMux           *http.ServeMux
 	RootObjectPath         string
+	// Real filesystem root, captured from RootObjectPath during Init before it
+	// is reset to "./". Used to resolve absolute paths for external tools
+	// (ffmpeg), which run with dms's working directory rather than the media
+	// root.
+	rootPath string
 	OnBrowseDirectChildren func(path string, rootObjectPath string, host, userAgent string) (ret []interface{}, err error)
 	OnBrowseMetadata       func(path string, rootObjectPath string, host, userAgent string) (ret interface{}, err error)
 	rootDescXML            []byte
@@ -467,7 +472,13 @@ func (me *Server) serveDLNATranscode(w http.ResponseWriter, r *http.Request, pat
 		}
 		logFile = aLogFile
 	}
-	p, err := ts.Transcode(path_, range_.Start, range_.End-range_.Start, logFile)
+	// External ffmpeg runs with dms's working directory, not the media root, so
+	// it needs an absolute path. In dynamic mode path_ is a command, not a file.
+	transcodePath := path_
+	if !dynamicMode {
+		transcodePath = filepath.Join(me.rootPath, path_)
+	}
+	p, err := ts.Transcode(transcodePath, range_.Start, range_.End-range_.Start, logFile)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -687,7 +698,7 @@ func (me *Server) serveIcon(w http.ResponseWriter, r *http.Request) {
 func (me *Server) serveSubtitle(w http.ResponseWriter, r *http.Request) {
 	filePath := me.filePath(r.URL.Query().Get("path"))
 	subtitleFilePath := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + ".srt"
-	http.ServeFile(w, r, subtitleFilePath)
+	http.ServeFileFS(w, r, me.FS, subtitleFilePath)
 }
 
 func (server *Server) contentDirectoryInitialEvent(urls []*url.URL, sid string) {
@@ -799,7 +810,7 @@ func (server *Server) contentDirectoryEventSubHandler(w http.ResponseWriter, r *
 }
 
 func (server *Server) serveDynamicStream(w http.ResponseWriter, r *http.Request, metadataPath string) error {
-	dmsMediaItem, err := readDynamicStream(metadataPath)
+	dmsMediaItem, err := readDynamicStream(server.FS, metadataPath)
 	if err != nil {
 		return err
 	}
@@ -962,6 +973,7 @@ func (srv *Server) Init() (err error) {
 		fsys := os.DirFS(srv.RootObjectPath)
 		srv.FS = fsys
 	}
+	srv.rootPath = srv.RootObjectPath
 	srv.RootObjectPath = "./"
 	srv.eventingLogger = srv.Logger.With(slog.String("subsystem", "eventing"))
 	srv.eventingLogger.Debug("eventing logger initialized")
@@ -1102,7 +1114,7 @@ func (srv *Server) ffmpegProbe(path string) (info *ffprobe.Info, err error) {
 	key := ffmpegInfoCacheKey{path, fi.ModTime().UnixNano()}
 	value, ok := srv.FFProbeCache.Get(key)
 	if !ok {
-		uri := fmt.Sprintf("http://127.0.0.1:%d%s?path=%s", srv.httpPort(), resPath, path)
+		uri := fmt.Sprintf("http://localhost:%d%s?path=%s", srv.httpPort(), resPath, path)
 		info, err = ffprobe.Run(uri)
 		err = suppressFFmpegProbeDataErrors(err)
 		srv.FFProbeCache.Set(key, info)
